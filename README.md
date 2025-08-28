@@ -85,13 +85,13 @@ def lambda_handler(event, context):
 
 # roles
 
-# env-aslan-sftp-transfer-logging-access e.g. prod-aslan-sftp-transfer-logging access
+## env-aslan-sftp-transfer-logging-access e.g. prod-aslan-sftp-transfer-logging access
 
 Purpose: allows cloudwatch logging for the Transfer server
 Trust relationship: Transfer
 Permissions: AWS Transfer Logging Access
 
-# prod-sftp-server-role 
+## prod-sftp-server-role 
 
 Purpose: allows the execution of a lamdda function and logging of the lambda function to cloudwatch on behalf of AWS Transfer
 Trust relationship: Transfer
@@ -129,7 +129,7 @@ Permissions: Custom Policy 'log and launch'
     ]
 }
 
-# prod-sftp-transfer-role
+## prod-sftp-transfer-role
 
 Purpose: allows the execution of file movements by a user on the sftp server
 Trust Relationship: Transfer
@@ -168,7 +168,7 @@ Permissions: Custom Policy 'env-sftp-read-write'
     ]
 }
 
-# prod-sftp-transfer-rename-role
+## prod-sftp-transfer-rename-role
 
 Purpose: allows the lambda execution and s3 access to handle the file rename
 Trust Relationship: Lambda

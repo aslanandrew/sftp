@@ -26,6 +26,22 @@ _secrets = None
 
 # ---------- Slack helpers ----------
 
+import json
+import boto3
+from datetime import datetime
+import os
+import logging
+import urllib.request
+import urllib.error
+
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+s3 = boto3.client('s3')
+_secrets = None
+
+# ---------- Slack helpers ----------
+
 def _get_slack_webhook_url():
     secret_id = os.getenv("SLACK_WEBHOOK_SECRET_ID")
     if secret_id:
@@ -79,7 +95,7 @@ def _human_size(n):
     return f"{n:.0f} EB"
 
 
-def _build_slack_payload(event, bucket, old_key, new_key, size_bytes, status="SUCCESS"):
+def _build_slack_payload(event, bucket, old_key, new_key, size_bytes, status="SUCCESS", error_message=None):
     username = event.get("username") or event.get("userName") or event.get("user-name")
     size_str = _human_size(size_bytes) if size_bytes is not None else "unknown"
 
@@ -91,8 +107,12 @@ def _build_slack_payload(event, bucket, old_key, new_key, size_bytes, status="SU
         {
             "type": "section",
             "text": {"type": "mrkdwn", "text": f"*Status:* `{status}`\n*Bucket:* `{bucket}`"}
-        },
-        {
+        }
+    ]
+
+    if status == "SUCCESS":
+        # Normal rename details
+        blocks.append({
             "type": "section",
             "fields": [
                 {"type": "mrkdwn", "text": f"*Original:*\n`{old_key}`"},
@@ -100,14 +120,112 @@ def _build_slack_payload(event, bucket, old_key, new_key, size_bytes, status="SU
                 {"type": "mrkdwn", "text": f"*Size:*\n{size_str}"},
                 {"type": "mrkdwn", "text": f"*User:*\n`{username or 'unknown'}`"}
             ]
-        },
-        {"type": "divider"}
-    ]
+        })
+    else:
+        # Error details (no Renamed key)
+        fields = [
+            {"type": "mrkdwn", "text": f"*Original:*\n`{old_key}`"},
+            {"type": "mrkdwn", "text": f"*User:*\n`{username or 'unknown'}`"}
+        ]
+        if error_message:
+            fields.append({"type": "mrkdwn", "text": f"*Error:*\n```{error_message}```"})
+        blocks.append({"type": "section", "fields": fields})
+
+    blocks.append({"type": "divider"})
 
     return {
-        "text": f"Aslan data file received: {new_key} ({size_str})",  # fallback text
+        "text": f"Aslan data file {'processed' if status=='SUCCESS' else 'error'}: {old_key}",
         "blocks": blocks,
     }
+
+# ---------- Main handler ----------
+```
+def lambda_handler(event, context):
+    """
+    Triggered by AWS Transfer Family WORKFLOW (preferred) or S3 event (for testing).
+    Renames the uploaded file by appending a UTC timestamp, then posts to Slack.
+    """
+    log.info("Received event: %s", json.dumps(event))
+
+    # --- Locate object from event ---
+    if 'fileLocation' in event:  # Transfer Family workflow payload
+        bucket = event['fileLocation']['bucket']
+        key = event['fileLocation']['key']
+        # Try to capture file size if provided by workflow
+        size_bytes = event.get("fileSize") or event.get("filesize") or None
+    elif 'Records' in event and 's3' in event['Records'][0]:  # S3 event testing
+        bucket = event['Records'][0]['s3']['bucket']['name']
+        key = event['Records'][0]['s3']['object']['key']
+        size_bytes = event['Records'][0]['s3']['object'].get('size')
+    else:
+        log.error("Could not determine file location from event.")
+        return {'statusCode': 400,
+                'body': json.dumps('Could not determine file location from event.')}
+
+    log.info("Processing file: s3://%s/%s", bucket, key)
+
+    # --- Build new key with timestamp ---
+    directory = os.path.dirname(key)
+    filename_with_ext = os.path.basename(key)
+    filename, extension = os.path.splitext(filename_with_ext)
+    timestamp = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    new_filename = f"{filename}_{timestamp}{extension}"
+    new_key = f"{directory}/{new_filename}" if directory else new_filename
+
+    # --- Perform rename (copy+delete) ---
+    try:
+        copy_source = {'Bucket': bucket, 'Key': key}
+        s3.copy_object(Bucket=bucket, CopySource=copy_source, Key=new_key)
+        log.info("Copied s3://%s/%s to s3://%s/%s", bucket, key, bucket, new_key)
+
+        s3.delete_object(Bucket=bucket, Key=key)
+        log.info("Deleted original s3://%s/%s", bucket, key)
+
+        # get size if we still don't have it
+        if size_bytes is None:
+            try:
+                head = s3.head_object(Bucket=bucket, Key=new_key)
+                size_bytes = head.get("ContentLength")
+            except Exception as e:
+                log.warning("Could not get size for s3://%s/%s: %s", bucket, new_key, e)
+
+        status_msg = f'File successfully renamed to {new_filename}'
+
+    except Exception as e:
+        log.error("Error during rename: %s", e)
+        _maybe_post_slack(event, bucket, key, new_key, size_bytes, status="ERROR", error_message=str(e))
+        raise
+
+    # --- Post to Slack (best-effort by default) ---
+    _maybe_post_slack(event, bucket, key, new_key, size_bytes, status="SUCCESS")
+
+    return {'statusCode': 200, 'body': json.dumps(status_msg)}
+
+
+def _maybe_post_slack(event, bucket, old_key, new_key, size_bytes, status, error_message=None):
+    """
+    Posts to Slack. Controlled by env vars:
+      - DISABLE_SLACK=true  -> don’t post
+      - FAIL_ON_SLACK_ERROR=true -> raise if Slack fails (default: False)
+    """
+    if os.getenv("DISABLE_SLACK", "").lower() == "true":
+        log.info("Slack disabled by DISABLE_SLACK env var.")
+        return
+
+    try:
+        webhook = _get_slack_webhook_url()
+        payload = _build_slack_payload(
+            event, bucket, old_key, new_key, size_bytes,
+            status=status, error_message=error_message
+        )
+        _post_to_slack(webhook, payload)
+        log.info("Posted Slack notification.")
+    except Exception as e:
+        log.error("Slack post failed: %s", e)
+        if os.getenv("FAIL_ON_SLACK_ERROR", "").lower() == "true":
+            # Bubble up to fail the whole invocation if desired
+            raise
+
 
 # ---------- Main handler ----------
 
@@ -195,7 +313,7 @@ def _maybe_post_slack(event, bucket, old_key, new_key, size_bytes, status):
         if os.getenv("FAIL_ON_SLACK_ERROR", "").lower() == "true":
             # Bubble up to fail the whole invocation if desired
             raise
-
+```
 
 # roles
 
